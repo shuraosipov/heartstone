@@ -15,6 +15,8 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from io import BytesIO
 import re
+import os
+from openai import OpenAI
 
 # Set page config
 st.set_page_config(
@@ -687,6 +689,15 @@ if 'card_database' not in st.session_state:
 if 'analysis_history' not in st.session_state:
     st.session_state.analysis_history = []
 
+# Initialize OpenAI client
+if 'openai_client' not in st.session_state:
+    try:
+        # Try to initialize with environment variable
+        st.session_state.openai_client = OpenAI()
+    except Exception as e:
+        st.session_state.openai_client = None
+        print(f"Error initializing OpenAI client: {e}")
+
 # Initialize chat history in session state
 if 'chat_history' not in st.session_state:
     st.session_state.chat_history = [
@@ -1185,7 +1196,66 @@ def create_sample_game_state():
     return game_state
 
 def process_chat_query(query, game_state=None):
-    """Process a user's chat query and generate a response"""
+    """Process a user's chat query using OpenAI's GPT-4o and generate a response"""
+    
+    # If OpenAI client is not initialized, fall back to rule-based responses
+    if st.session_state.openai_client is None:
+        return fallback_chat_response(query, game_state)
+    
+    try:
+        # Prepare the conversation history for the API
+        messages = []
+        
+        # System message with context and instructions
+        system_message = """You are an expert Hearthstone assistant helping players improve their gameplay.
+        Be concise, accurate, and friendly. Your responses should reflect deep knowledge of the Hearthstone meta,
+        card interactions, and optimal play strategies. If the user asks about their current game, use the game state 
+        information I'll provide to give personalized advice."""
+        
+        messages.append({"role": "system", "content": system_message})
+        
+        # Add game state information if available
+        if game_state:
+            game_state_desc = f"""
+            Current game state:
+            - Turn {game_state.turn_number}, {'your' if game_state.current_player == 'player' else "opponent's"} turn
+            - You: {game_state.player.hero_class}, {game_state.player.health} health, {game_state.player.armor} armor, {game_state.player.mana}/{game_state.player.max_mana} mana
+            - Opponent: {game_state.opponent.hero_class}, {game_state.opponent.health} health, {game_state.opponent.armor} armor
+            - Your board: {len(game_state.player.battlefield)} minions
+            - Opponent's board: {len(game_state.opponent.battlefield)} minions
+            - Cards in your hand: {len(game_state.player.hand)}
+            - Your deck remaining: {game_state.player_deck_remaining} cards
+            - Opponent's deck remaining: {game_state.opponent_deck_remaining} cards
+            """
+            messages.append({"role": "system", "content": game_state_desc})
+        
+        # Add conversation history (up to last 5 messages to keep context manageable)
+        chat_history = st.session_state.chat_history[-10:]  # Get last 10 messages
+        for message in chat_history:
+            if message["role"] in ["user", "assistant"]:  # Make sure we only include valid roles
+                messages.append({"role": message["role"], "content": message["content"]})
+        
+        # Add the current query
+        messages.append({"role": "user", "content": query})
+        
+        # Call the OpenAI API
+        response = st.session_state.openai_client.chat.completions.create(
+            model="gpt-4o",  # You can change this to a different model if needed
+            messages=messages,
+            max_tokens=500,  # Limit response length
+            temperature=0.7  # Adjust creativity vs. determinism
+        )
+        
+        # Extract and return the response content
+        return response.choices[0].message.content
+        
+    except Exception as e:
+        print(f"Error calling OpenAI API: {e}")
+        # Fallback to rule-based responses if API call fails
+        return fallback_chat_response(query, game_state)
+
+def fallback_chat_response(query, game_state=None):
+    """Fallback to rule-based responses if the OpenAI API is unavailable"""
     # Simple rule-based responses
     query = query.lower().strip()
     
@@ -1787,6 +1857,19 @@ def chat_ui():
     # Get the current game state if available
     current_game_state = st.session_state.game_state if 'game_state' in st.session_state else None
     
+    # API Key input (optional, can use environment variable instead)
+    with st.expander("OpenAI API Settings"):
+        api_key = st.text_input("OpenAI API Key (optional if set via environment variable)", 
+                              type="password", help="Your OpenAI API key for GPT-4o access")
+        
+        if api_key:
+            # Update client with new API key
+            try:
+                st.session_state.openai_client = OpenAI(api_key=api_key)
+                st.success("OpenAI API client initialized successfully!")
+            except Exception as e:
+                st.error(f"Error initializing OpenAI client: {e}")
+    
     # Draw the chat UI
     st.markdown('<div class="chat-header"><h3>🧙‍♂️ Hearthstone AI Chat</h3></div>', unsafe_allow_html=True)
     
@@ -1799,23 +1882,36 @@ def chat_ui():
             else:
                 st.markdown(f'<div class="chat-message assistant-message">{message["content"]}</div>', unsafe_allow_html=True)
     
-    # Chat input
-    user_input = st.text_input("Ask me anything about Hearthstone", key="chat_input", 
-                               placeholder="e.g., 'How do I play against Mage?' or 'What's the best play now?'",
-                               label_visibility="collapsed")
+    # Initialize chat_input in session state if not already present
+    if 'chat_input' not in st.session_state:
+        st.session_state.chat_input = ""
     
-    if user_input:
-        # Add user message to chat
-        st.session_state.chat_history.append({"role": "user", "content": user_input})
-        
-        # Process the query and get response
-        assistant_response = process_chat_query(user_input, current_game_state)
-        
-        # Add assistant response to chat
-        st.session_state.chat_history.append({"role": "assistant", "content": assistant_response})
-        
-        # Clear the input box (need to rerun to show the updated chat)
-        st.rerun()
+    # Function to handle submission and clear input
+    def submit_message():
+        if st.session_state.chat_input:
+            user_message = st.session_state.chat_input
+            
+            # Add user message to chat
+            st.session_state.chat_history.append({"role": "user", "content": user_message})
+            
+            # Process the query and get response
+            with st.spinner("Thinking..."):
+                assistant_response = process_chat_query(user_message, current_game_state)
+            
+            # Add assistant response to chat
+            st.session_state.chat_history.append({"role": "assistant", "content": assistant_response})
+            
+            # Clear the input
+            st.session_state.chat_input = ""
+    
+    # Chat input with callback
+    st.text_input(
+        "Ask me anything about Hearthstone", 
+        key="chat_input",
+        placeholder="e.g., 'How do I play against Mage?' or 'What's the best play now?'",
+        label_visibility="collapsed",
+        on_change=submit_message
+    )
     
     st.markdown('<div class="chat-footer"></div>', unsafe_allow_html=True)
     
